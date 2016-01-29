@@ -10,6 +10,7 @@ object Extensions {
   private val extensionDeps = TaskKey[(File, File)]("extension dependencies")
   val extensions = TaskKey[Seq[File]]("extensions", "builds extensions")
   val extension = InputKey[Seq[File]]("extension", "build a single extension")
+  val submoduleUpdate = TaskKey[Unit]("checks out all submodules")
 
   val isDirectory = new java.io.FileFilter {
     override def accept(f: File) = f.isDirectory
@@ -24,7 +25,7 @@ object Extensions {
     }
   }
 
-  val extensionsTask = Seq(
+  lazy val extensionsTask = Seq(
     extensionDeps := {
       val packagedNetLogoJar     = (packageBin in Compile).value
       val packagedNetLogoTestJar = (packageBin in Test).value
@@ -36,22 +37,32 @@ object Extensions {
       val s = streams.value
       val scala = scalaInstance.value
 
-      buildExtension(extensionDir, scala.libraryJar, packagedNetLogoJar, s.log, state.value)(Set()).toSeq
+      Seq(buildExtension(extensionDir, scala.libraryJar, packagedNetLogoJar, s.log, state.value))
     },
-    extensions := {
-      val base                   = baseDirectory.value
+    extensions <<= Def.taskDyn {
       val (packagedNetLogoJar, packagedNetLogoTestJar) = extensionDeps.value
-      val s = streams.value
-      val scala = scalaInstance.value
-      ("git -C " + base + " submodule --quiet update --init") ! s.log
-      val dirs = extensionDirs(baseDirectory.value)
-      dirs.flatMap{ dir =>
-        cacheBuild(s.cacheDirectory, dir, Set(base / "NetLogo.jar", base / "NetLogoLite.jar"))(
-          buildExtension(dir, scala.libraryJar, packagedNetLogoJar, s.log, state.value))
-      }
+      new Scoped.RichTaskSeq(extensionDirs.value.map(buildExtensionTask(packagedNetLogoJar))).join dependsOn(submoduleUpdate)
+    },
+    submoduleUpdate := {
+      ("git -C " + baseDirectory.value + " submodule --quiet update --init") ! streams.value.log
     }
   )
 
+  lazy val extensionDirs: Def.Initialize[Task[Seq[File]]] =
+    Def.task {
+      val isDirectory = new java.io.FileFilter {
+        override def accept(f: File) = f.isDirectory
+      }
+      IO.listFiles(isDirectory)(baseDirectory.value / "extensions").toSeq
+    }
+
+  lazy val fileDependencies: Def.Initialize[Set[File]] =
+    Def.setting {
+      Set(
+        baseDirectory.value / "NetLogo.jar",
+        baseDirectory.value / "NetLogoLite.jar"
+      )
+    }
 
   class NestedConfiguration(val config: xsbti.AppConfiguration, baseDir: File, args: Array[String]) extends xsbti.AppConfiguration {
     override val arguments = args
@@ -64,23 +75,25 @@ object Extensions {
   def config(state: State, dir: File, command: String) =
     new NestedConfiguration(state.configuration, dir, Array(command))
 
-  private def cacheBuild(cacheDirectory: File, extensionDir: File, otherDeps: Set[File])
-                        (build: Set[File] => Set[File]): Seq[File] = {
-    val buildCached = FileFunction.cached(cacheDirectory / "extensions" / extensionDir.getName,
-        inStyle = FilesInfo.hash, outStyle = FilesInfo.hash)(build)
-    buildCached(otherDeps).toSeq
-  }
+  private def buildExtensionTask(packagedNetLogoJar: File)(dir: File): Def.Initialize[Task[File]] =
+    Def.task {
+      FileFunction.cached(streams.value.cacheDirectory / "extensions" / dir.getName,
+        inStyle = FilesInfo.hash, outStyle = FilesInfo.hash)(
+        { files =>
+          Set(buildExtension(dir, scalaInstance.value.libraryJar, packagedNetLogoJar, streams.value.log, state.value))
+        })(fileDependencies.value).head
+    }
 
-  private def buildExtension(dir: File, scalaLibrary: File, netLogoJar: File, log: Logger, state: State): Set[File] => Set[File] = {
+  private def buildExtension(dir: File, scalaLibrary: File, netLogoJar: File, log: Logger, state: State): File = {
     log.info("building extension: " + dir.getName)
     System.setProperty("netlogo.jar.url", netLogoJar.toURI.toString)
     val buildConfig  = config(state, dir, "package")
     val jar = dir / (dir.getName + ".jar")
     runner.run(buildConfig) match {
-      case e: xsbti.Exit   => assert(e.code == 0, "extension build failed, exitCode = " + e.code)
-      case r: xsbti.Reboot => assert(true == false, "expected application to build, instead rebooted")
+      case e: xsbti.Exit   => assert(e.code == 0, "extension build " + dir.getName + " failed, exitCode = " + e.code)
+      case r: xsbti.Reboot => assert(true == false, "expected extension " + dir.getName + " to build, rebooted instead")
     }
-    { files => Set(jar) }
+    jar
   }
 
 }
